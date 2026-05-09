@@ -15,7 +15,7 @@ import traci
 #   1 = 启用仿生编队规则
 #   2 = 关闭仿生编队规则，仅运行基础自动驾驶与安全层
 #   3 = 连续运行关闭/开启两组实验，并保存对比结果
-RUN_MODE = 2
+RUN_MODE = 3
 
 # 是否打开 SUMO GUI 窗口；False 表示后台无界面运行。
 USE_GUI = True
@@ -104,16 +104,29 @@ IDM_DELTA = 4
 # IDM 默认时间头距，单位 s。
 IDM_TIME_HEADWAY = 1.2
 # 仿生编队层参数：只在基础单车自动驾驶速度上做小幅修正。
-# 这些规则不直接接管安全和换道，只诱导局部速度同步与紧凑行驶。
-SWARM_ALIGNMENT_GAIN = 0.08
-SWARM_COHESION_GAIN = 0.25
-SWARM_SEPARATION_GAIN = 0.0
-SWARM_DESIRED_HEADWAY = 0.75
+# 规则灵感来自 ADEPT 的局部间距触发和 Boids 的对齐/内聚/分离。
+SWARM_ALIGNMENT_GAIN = 0.06
+SWARM_COHESION_GAIN = 0.22
+SWARM_SEPARATION_GAIN = 0.18
+SWARM_MATCH_GAIN = 0.08
+SWARM_DESIRED_HEADWAY = 0.85
 SWARM_MIN_PLATOON_GAP = 4.5
-SWARM_MAX_SPEED_DELTA = 0.6
+SWARM_GAP_TOLERANCE = 2.0
+SWARM_MAX_ACCEL_DELTA = 0.55
+SWARM_MAX_DECEL_DELTA = 0.45
 # 仿生层参考车辆筛选：低速/停止车辆通常代表局部受阻，不参与畅通车道的速度对齐。
 SWARM_MIN_REFERENCE_SPEED = 5.0
 SWARM_REFERENCE_SPEED_RATIO = 0.7
+# 队列变换规则：以转向灯作为“信息素”，让拥堵趋势沿车辆队列延迟传播。
+SWARM_RECONFIG_LOOKAHEAD = SENSING_RANGE
+SWARM_RECONFIG_LOW_SPEED = 4.0
+SWARM_RECONFIG_MIN_TARGET_CLEARANCE = 25.0
+SWARM_RECONFIG_SPEED_BONUS = 0.35
+SWARM_SIGNAL_DELAY = 1.0
+SWARM_SIGNAL_MEMORY = 4.0
+SWARM_SIGNAL_PREPARE_DECEL = 0.25
+LEFT_SIGNAL_BIT = 2
+RIGHT_SIGNAL_BIT = 1
 
 # 实验统计结果和 GUI 配置文件路径。
 RESULTS_FILE = os.path.join(os.path.dirname(__file__), "platoon_results.csv")
@@ -481,19 +494,186 @@ def maybe_execute_mobil_lane_change(veh_id, leader, obstacle):
         traci.vehicle.changeLane(veh_id, best_lane, LANE_CHANGE_DURATION)
 
 
-def apply_swarm_layer(base_speed, current_speed, neighbors, leader):
-    """上层仿生编队规则：在有限感知内诱导局部正向协同。
+def get_lane_clearance_ahead(veh_id, target_lane):
+    """仿生层辅助函数：估计目标车道前方最近车辆/障碍物距离。"""
+    ego_pos = traci.vehicle.getLanePosition(veh_id)
+    clearance = OBSTACLE_LOOKAHEAD
+
+    for other_id in traci.vehicle.getIDList():
+        if other_id == veh_id:
+            continue
+
+        try:
+            if traci.vehicle.getRoadID(other_id) != ROAD_EDGE_ID:
+                continue
+            if traci.vehicle.getLaneIndex(other_id) != target_lane:
+                continue
+        except traci.TraCIException:
+            continue
+
+        gap = traci.vehicle.getLanePosition(other_id) - ego_pos
+        if 0 <= gap < clearance:
+            clearance = gap
+
+    for obstacle_item in OBSTACLES:
+        if int(obstacle_item["lane"]) != target_lane:
+            continue
+        gap = float(obstacle_item["position"]) - ego_pos
+        if 0 <= gap < clearance:
+            clearance = gap
+
+    return clearance
+
+
+def detect_queue_blockage(current_speed, leader, obstacle):
+    """仿生层辅助函数：识别前方障碍物、停车队列或低速车辆形成的阻塞。"""
+    if obstacle and obstacle["distance"] <= SWARM_RECONFIG_LOOKAHEAD:
+        return obstacle["distance"]
+
+    if not leader:
+        return None
+
+    leader_speed = leader.get("speed", current_speed)
+    if (
+        leader["distance"] <= SWARM_RECONFIG_LOOKAHEAD
+        and leader_speed <= SWARM_RECONFIG_LOW_SPEED
+        and current_speed > leader_speed + 1.0
+    ):
+        return leader["distance"]
+
+    return None
+
+
+def choose_safe_reconfiguration_direction(veh_id, blockage_distance):
+    """选择安全且更畅通的相邻车道方向；返回 -1/1/0，分别表示下/上/不换道。"""
+    current_lane = traci.vehicle.getLaneIndex(veh_id)
+    best_direction = 0
+    best_clearance = blockage_distance
+
+    for target_lane in (current_lane - 1, current_lane + 1):
+        if target_lane < 0 or target_lane > 2:
+            continue
+        if not lane_has_space_for_change(veh_id, target_lane):
+            continue
+
+        clearance = get_lane_clearance_ahead(veh_id, target_lane)
+        if clearance > best_clearance and clearance >= SWARM_RECONFIG_MIN_TARGET_CLEARANCE:
+            best_direction = target_lane - current_lane
+            best_clearance = clearance
+
+    return best_direction
+
+
+def set_turn_signal(veh_id, direction):
+    """设定转向灯信号；direction=-1 表示向低编号车道，1 表示向高编号车道。"""
+    if direction < 0:
+        traci.vehicle.setSignals(veh_id, RIGHT_SIGNAL_BIT)
+    elif direction > 0:
+        traci.vehicle.setSignals(veh_id, LEFT_SIGNAL_BIT)
+    else:
+        traci.vehicle.setSignals(veh_id, 0)
+
+
+def get_turn_signal_direction(veh_id):
+    """读取前车转向灯方向；返回 -1/1/0。"""
+    try:
+        signals = traci.vehicle.getSignals(veh_id)
+    except traci.TraCIException:
+        return 0
+
+    if signals & RIGHT_SIGNAL_BIT:
+        return -1
+    if signals & LEFT_SIGNAL_BIT:
+        return 1
+    return 0
+
+
+def maybe_execute_swarm_reconfiguration(veh_id, current_speed, leader, obstacle, vehicle_states):
+    """仿生队列变换：通过转向灯信息素传播拥堵与重组意图。"""
+    blockage_distance = detect_queue_blockage(current_speed, leader, obstacle)
+    current_lane = traci.vehicle.getLaneIndex(veh_id)
+    sim_time = traci.simulation.getTime()
+    state = vehicle_states.setdefault(veh_id, {})
+
+    if blockage_distance is not None:
+        direction = choose_safe_reconfiguration_direction(veh_id, blockage_distance)
+        state["pheromone_direction"] = direction
+        state["pheromone_time"] = sim_time
+        set_turn_signal(veh_id, direction)
+        if direction == 0:
+            return False
+    else:
+        direction = 0
+        if leader:
+            leader_direction = get_turn_signal_direction(leader["id"])
+            leader_state = vehicle_states.get(leader["id"], {})
+            signal_time = leader_state.get("pheromone_time")
+            signal_is_fresh = (
+                signal_time is not None
+                and sim_time - signal_time <= SWARM_SIGNAL_MEMORY
+                and sim_time - signal_time >= SWARM_SIGNAL_DELAY
+            )
+            if leader_direction and signal_is_fresh:
+                direction = leader_direction
+                state["pheromone_direction"] = direction
+                state["pheromone_time"] = sim_time
+                set_turn_signal(veh_id, direction)
+            else:
+                state.pop("pheromone_direction", None)
+                state.pop("pheromone_time", None)
+                set_turn_signal(veh_id, 0)
+        else:
+            state.pop("pheromone_direction", None)
+            state.pop("pheromone_time", None)
+            set_turn_signal(veh_id, 0)
+
+        if direction == 0:
+            return False
+
+    target_lane = current_lane + direction
+    if target_lane < 0 or target_lane > 2:
+        state.pop("pheromone_direction", None)
+        state.pop("pheromone_time", None)
+        set_turn_signal(veh_id, 0)
+        return False
+    if not lane_has_space_for_change(veh_id, target_lane):
+        return False
+
+    traci.vehicle.changeLane(veh_id, target_lane, LANE_CHANGE_DURATION)
+    return True
+
+
+def apply_swarm_layer(
+    base_speed,
+    current_speed,
+    neighbors,
+    leader,
+    veh_id=None,
+    obstacle=None,
+    vehicle_states=None,
+):
+    """上层仿生编队规则：有限感知下的 ADEPT-Boids 混合局部规则。
 
     设计原则：
     1. 不替代单车自动驾驶层，只在 IDM/MOBIL 给出的 base_speed 上做小幅修正。
     2. 不直接处理危险工况，最终仍交给后续安全层和 SUMO fallback 兜底。
     3. 只使用本车有限感知到的邻居信息，让类似编队的行为自发涌现。
-    4. 当前版本只做正向速度微调，不主动降速；降速由安全层和 IDM 负责。
+    4. 低速/停止邻居代表局部受阻，不作为畅通车辆的速度对齐对象。
     """
-    if not neighbors:
-        return base_speed
+    reconfigured = False
+    if veh_id is not None and vehicle_states is not None:
+        reconfigured = maybe_execute_swarm_reconfiguration(
+            veh_id, current_speed, leader, obstacle, vehicle_states
+        )
 
-    speed_delta = 0.0
+    speed_delta = SWARM_RECONFIG_SPEED_BONUS if reconfigured else 0.0
+    if not reconfigured and veh_id is not None and vehicle_states is not None:
+        state = vehicle_states.get(veh_id, {})
+        signal_time = state.get("pheromone_time")
+        if signal_time is not None and traci.simulation.getTime() - signal_time <= SWARM_SIGNAL_MEMORY:
+            # 看到前车信息素但暂未完成换道时，轻微预减速，为队列变换留出空间。
+            speed_delta -= SWARM_SIGNAL_PREPARE_DECEL
+
     reference_neighbors = [
         item
         for item in neighbors
@@ -501,27 +681,35 @@ def apply_swarm_layer(base_speed, current_speed, neighbors, leader):
         and item["speed"] >= current_speed * SWARM_REFERENCE_SPEED_RATIO
     ]
 
-    # 规则 1：正向速度对齐。低速/停车邻居不参与对齐，避免畅通车道被堵塞车道拖慢。
+    # Boids-Alignment：只与仍在流动的邻居做弱速度对齐，避免被障碍物前的停车队列拖慢。
     if reference_neighbors:
         neighbor_mean_speed = statistics.fmean(item["speed"] for item in reference_neighbors)
-        if neighbor_mean_speed > current_speed:
-            speed_delta += SWARM_ALIGNMENT_GAIN * (neighbor_mean_speed - current_speed)
+        speed_delta += SWARM_ALIGNMENT_GAIN * (neighbor_mean_speed - current_speed)
 
-    # 规则 2：温和凝聚。当前车距大于期望头距时，允许略微追赶前方车群。
     if leader:
+        # ADEPT-R1/R2/R3：围绕 d +/- delta 的局部间距触发，不需要全局领车。
         desired_gap = max(
             SWARM_MIN_PLATOON_GAP,
             current_speed * SWARM_DESIRED_HEADWAY,
         )
-        gap_error = leader["distance"] - desired_gap
-        if gap_error > 0:
-            speed_delta += SWARM_COHESION_GAIN * min(gap_error / desired_gap, 1.0)
+        lower_gap = max(SAFE_DISTANCE, desired_gap - SWARM_GAP_TOLERANCE)
+        upper_gap = desired_gap + SWARM_GAP_TOLERANCE
+        gap = leader["distance"]
+        leader_speed = leader.get("speed", current_speed)
 
-        # 规则 3：分离占位。当前暂不主动降速，避免与安全层/IDM 形成重复保守控制。
-        if gap_error < 0 and SWARM_SEPARATION_GAIN > 0:
-            speed_delta += SWARM_SEPARATION_GAIN * max(gap_error / desired_gap, -1.0)
+        if gap > upper_gap:
+            # R1/Boids-Cohesion：前方局部车群较远时，轻微加速追赶。
+            gap_ratio = min((gap - upper_gap) / max(desired_gap, 0.1), 1.0)
+            speed_delta += SWARM_COHESION_GAIN * gap_ratio
+        elif gap < lower_gap:
+            # R2/Boids-Separation：间距偏小时轻微降速，但幅度受限，安全层仍是最终约束。
+            gap_ratio = min((lower_gap - gap) / max(desired_gap, 0.1), 1.0)
+            speed_delta -= SWARM_SEPARATION_GAIN * gap_ratio
+        else:
+            # R3/Match：间距处于容许带内时，弱匹配前车速度以形成局部队列。
+            speed_delta += SWARM_MATCH_GAIN * (leader_speed - current_speed)
 
-    speed_delta = clamp(speed_delta, 0.0, SWARM_MAX_SPEED_DELTA)
+    speed_delta = clamp(speed_delta, -SWARM_MAX_DECEL_DELTA, SWARM_MAX_ACCEL_DELTA)
     return base_speed + speed_delta
 
 
@@ -634,7 +822,15 @@ def compute_layered_target_speed(veh_id, vehicle_states, enable_swarm_rules):
     target_speed = idm_target_speed(current_speed, leader, obstacle, params)
     if enable_swarm_rules:
         # 仿生编队层采用温和局部规则，最终仍受安全层限制。
-        target_speed = apply_swarm_layer(target_speed, current_speed, neighbors, leader)
+        target_speed = apply_swarm_layer(
+            target_speed,
+            current_speed,
+            neighbors,
+            leader,
+            veh_id=veh_id,
+            obstacle=obstacle,
+            vehicle_states=vehicle_states,
+        )
     target_speed = apply_safety_layer(target_speed, veh_id, leader, params)
     target_speed = apply_static_obstacle_safety(target_speed, veh_id, obstacle, params)
     return clamp(target_speed, MIN_SPEED, allowed_speed)
