@@ -2,6 +2,13 @@
 
 本文件记录每次上传到 GitHub 的工程更新内容。
 
+## 2026-05-09 fourth upload - 2026.5.9first
+
+- 更新 `main.py`，继续完善当前仿生编队与本地机制实验代码。
+- 删除已上传和本地新生成的测试/仿真日志 XML，包括 `test_swarm_*.xml`、`test_pheromone_*.xml`、`test_reconfig_*.xml`、`test_stagger_*.xml`、`test_local_mech_on.xml`。
+- 更新根目录 `.gitignore`，新增 `test_*.xml` 忽略规则，避免后续测试生成日志再次进入版本控制。
+- 保持源码、配置、文档和更新日志进入版本控制，测试生成物不再上传。
+
 ## 2026-05-09 third upload - 2026.5.9first
 
 - 更新 `main.py`，将运行模式调整为连续运行关闭/开启两组实验并保存对比结果。

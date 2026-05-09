@@ -127,6 +127,14 @@ SWARM_SIGNAL_MEMORY = 4.0
 SWARM_SIGNAL_PREPARE_DECEL = 0.25
 LEFT_SIGNAL_BIT = 2
 RIGHT_SIGNAL_BIT = 1
+# 直道展示用的类 X 形/菱形交错编队规则。
+# 通过相邻车道之间的半车距纵向错位，让三车道车辆呈现更直观的队形。
+SWARM_STAGGER_ENABLE = True
+SWARM_STAGGER_GAIN = 0.10
+SWARM_STAGGER_HEADWAY = 0.55
+SWARM_STAGGER_TOLERANCE = 2.0
+SWARM_STAGGER_MAX_DELTA = 0.35
+SWARM_STAGGER_CLEAR_OBSTACLE_DISTANCE = 45.0
 
 # 实验统计结果和 GUI 配置文件路径。
 RESULTS_FILE = os.path.join(os.path.dirname(__file__), "platoon_results.csv")
@@ -427,30 +435,41 @@ def idm_target_speed(current_speed, leader, obstacle, params):
 
 
 def lane_has_space_for_change(veh_id, target_lane):
-    """检查目标车道前后车辆和障碍物间距，判断是否满足安全换道条件。"""
+    """基于局部感知检查目标车道前后车辆和障碍物间距，判断是否满足安全换道条件。"""
     ego_pos = traci.vehicle.getLanePosition(veh_id)
+    current_lane = traci.vehicle.getLaneIndex(veh_id)
+    direction = target_lane - current_lane
 
-    for other_id in traci.vehicle.getIDList():
-        if other_id == veh_id:
-            continue
+    if abs(direction) != 1:
+        return False
 
+    try:
+        if not traci.vehicle.couldChangeLane(veh_id, direction):
+            return False
+    except traci.TraCIException:
+        return False
+
+    for mode in (0, 1, 2, 3):
         try:
-            if traci.vehicle.getRoadID(other_id) != ROAD_EDGE_ID:
-                continue
-            if traci.vehicle.getLaneIndex(other_id) != target_lane:
-                continue
+            lateral_neighbors = traci.vehicle.getNeighbors(veh_id, mode)
         except traci.TraCIException:
             continue
 
-        gap = traci.vehicle.getLanePosition(other_id) - ego_pos
-        if -MOBIL_BACK_SAFE_GAP < gap < MOBIL_FRONT_SAFE_GAP:
-            return False
+        for other_id, gap in lateral_neighbors:
+            try:
+                if traci.vehicle.getLaneIndex(other_id) != target_lane:
+                    continue
+            except traci.TraCIException:
+                continue
+
+            if -MOBIL_BACK_SAFE_GAP < gap < MOBIL_FRONT_SAFE_GAP:
+                return False
 
     for obstacle in OBSTACLES:
         if int(obstacle["lane"]) != target_lane:
             continue
         gap = float(obstacle["position"]) - ego_pos
-        if -MOBIL_BACK_SAFE_GAP < gap < OBSTACLE_LOOKAHEAD:
+        if -MOBIL_BACK_SAFE_GAP < gap < SENSING_RANGE:
             return False
 
     return True
@@ -495,31 +514,31 @@ def maybe_execute_mobil_lane_change(veh_id, leader, obstacle):
 
 
 def get_lane_clearance_ahead(veh_id, target_lane):
-    """仿生层辅助函数：估计目标车道前方最近车辆/障碍物距离。"""
+    """仿生层辅助函数：基于局部邻居估计目标车道前方最近车辆/障碍物距离。"""
     ego_pos = traci.vehicle.getLanePosition(veh_id)
-    clearance = OBSTACLE_LOOKAHEAD
+    clearance = SENSING_RANGE
 
-    for other_id in traci.vehicle.getIDList():
-        if other_id == veh_id:
-            continue
-
+    for mode in (0, 1, 2, 3):
         try:
-            if traci.vehicle.getRoadID(other_id) != ROAD_EDGE_ID:
-                continue
-            if traci.vehicle.getLaneIndex(other_id) != target_lane:
-                continue
+            lateral_neighbors = traci.vehicle.getNeighbors(veh_id, mode)
         except traci.TraCIException:
             continue
 
-        gap = traci.vehicle.getLanePosition(other_id) - ego_pos
-        if 0 <= gap < clearance:
-            clearance = gap
+        for other_id, gap in lateral_neighbors:
+            try:
+                if traci.vehicle.getLaneIndex(other_id) != target_lane:
+                    continue
+            except traci.TraCIException:
+                continue
+
+            if 0 <= gap < clearance:
+                clearance = gap
 
     for obstacle_item in OBSTACLES:
         if int(obstacle_item["lane"]) != target_lane:
             continue
         gap = float(obstacle_item["position"]) - ego_pos
-        if 0 <= gap < clearance:
+        if 0 <= gap <= SENSING_RANGE and gap < clearance:
             clearance = gap
 
     return clearance
@@ -643,6 +662,72 @@ def maybe_execute_swarm_reconfiguration(veh_id, current_speed, leader, obstacle,
     return True
 
 
+def find_adjacent_formation_reference(veh_id):
+    """寻找相邻车道中最近的流动车辆，作为交错队形的局部参考点。"""
+    best_reference = None
+    best_abs_gap = SENSING_RANGE
+
+    for mode in (0, 1, 2, 3):
+        try:
+            lateral_neighbors = traci.vehicle.getNeighbors(veh_id, mode)
+        except traci.TraCIException:
+            continue
+
+        for other_id, gap in lateral_neighbors:
+            try:
+                other_speed = traci.vehicle.getSpeed(other_id)
+                other_lane = traci.vehicle.getLaneIndex(other_id)
+            except traci.TraCIException:
+                continue
+
+            if other_speed < SWARM_MIN_REFERENCE_SPEED:
+                continue
+
+            abs_gap = abs(gap)
+            if abs_gap < best_abs_gap:
+                best_reference = {
+                    "id": other_id,
+                    "lane": other_lane,
+                    "gap": gap,
+                    "speed": other_speed,
+                }
+                best_abs_gap = abs_gap
+
+    return best_reference
+
+
+def compute_staggered_formation_delta(veh_id, current_speed, obstacle, reconfigured):
+    """计算类 X 形/菱形交错队形的速度微调量。"""
+    if not SWARM_STAGGER_ENABLE or veh_id is None or reconfigured:
+        return 0.0
+    if obstacle and obstacle["distance"] <= SWARM_STAGGER_CLEAR_OBSTACLE_DISTANCE:
+        return 0.0
+
+    reference = find_adjacent_formation_reference(veh_id)
+    if not reference:
+        return 0.0
+
+    ego_lane = traci.vehicle.getLaneIndex(veh_id)
+    # 中间车道与两侧车道保持半个期望车距错位，三车道视觉上呈现 X/菱形结构。
+    stagger_gap = max(SWARM_MIN_PLATOON_GAP, current_speed * SWARM_STAGGER_HEADWAY)
+    desired_gap = stagger_gap if ego_lane > reference["lane"] else -stagger_gap
+    gap_error = reference["gap"] - desired_gap
+
+    if abs(gap_error) <= SWARM_STAGGER_TOLERANCE:
+        return 0.0
+
+    normalized_error = clamp(
+        gap_error / max(stagger_gap, 0.1),
+        -1.0,
+        1.0,
+    )
+    return clamp(
+        SWARM_STAGGER_GAIN * normalized_error,
+        -SWARM_STAGGER_MAX_DELTA,
+        SWARM_STAGGER_MAX_DELTA,
+    )
+
+
 def apply_swarm_layer(
     base_speed,
     current_speed,
@@ -660,6 +745,11 @@ def apply_swarm_layer(
     3. 只使用本车有限感知到的邻居信息，让类似编队的行为自发涌现。
     4. 低速/停止邻居代表局部受阻，不作为畅通车辆的速度对齐对象。
     """
+    params = get_vehicle_params(veh_id, vehicle_states or {}) if veh_id is not None else {}
+    vehicle_max_speed = params.get("max_speed", MAX_SPEED)
+    vehicle_accel = params.get("accel", 2.6)
+    vehicle_decel = params.get("decel", 4.5)
+
     reconfigured = False
     if veh_id is not None and vehicle_states is not None:
         reconfigured = maybe_execute_swarm_reconfiguration(
@@ -673,6 +763,14 @@ def apply_swarm_layer(
         if signal_time is not None and traci.simulation.getTime() - signal_time <= SWARM_SIGNAL_MEMORY:
             # 看到前车信息素但暂未完成换道时，轻微预减速，为队列变换留出空间。
             speed_delta -= SWARM_SIGNAL_PREPARE_DECEL
+
+    # 类 X 形/菱形交错队形：仅在畅通直道上启用，遇障碍物或重组时暂停。
+    speed_delta += compute_staggered_formation_delta(
+        veh_id,
+        current_speed,
+        obstacle,
+        reconfigured,
+    )
 
     reference_neighbors = [
         item
@@ -709,8 +807,12 @@ def apply_swarm_layer(
             # R3/Match：间距处于容许带内时，弱匹配前车速度以形成局部队列。
             speed_delta += SWARM_MATCH_GAIN * (leader_speed - current_speed)
 
+    # 仿生层最终钳位：不能突破车辆自身最大速度、最大加速度和最大减速度。
     speed_delta = clamp(speed_delta, -SWARM_MAX_DECEL_DELTA, SWARM_MAX_ACCEL_DELTA)
-    return base_speed + speed_delta
+    raw_target_speed = clamp(base_speed + speed_delta, MIN_SPEED, vehicle_max_speed)
+    lower_mechanical_speed = max(MIN_SPEED, current_speed - vehicle_decel * STEP_LENGTH)
+    upper_mechanical_speed = min(vehicle_max_speed, current_speed + vehicle_accel * STEP_LENGTH)
+    return clamp(raw_target_speed, lower_mechanical_speed, upper_mechanical_speed)
 
 
 def apply_safety_layer(target_speed, veh_id, leader, params):
