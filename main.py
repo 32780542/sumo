@@ -15,7 +15,7 @@ import traci
 #   1 = 启用仿生编队规则
 #   2 = 关闭仿生编队规则，仅运行基础自动驾驶与安全层
 #   3 = 连续运行关闭/开启两组实验，并保存对比结果
-RUN_MODE = 1
+RUN_MODE = 2
 
 # 是否打开 SUMO GUI 窗口；False 表示后台无界面运行。
 USE_GUI = True
@@ -103,8 +103,17 @@ CRUISE_GAIN = 0.35
 IDM_DELTA = 4
 # IDM 默认时间头距，单位 s。
 IDM_TIME_HEADWAY = 1.2
-# 仿生编队层暂时清空；后续可以在 apply_swarm_layer() 中逐条添加新规则。
-ALIGNMENT_GAIN = 0.0
+# 仿生编队层参数：只在基础单车自动驾驶速度上做小幅修正。
+# 这些规则不直接接管安全和换道，只诱导局部速度同步与紧凑行驶。
+SWARM_ALIGNMENT_GAIN = 0.08
+SWARM_COHESION_GAIN = 0.25
+SWARM_SEPARATION_GAIN = 0.0
+SWARM_DESIRED_HEADWAY = 0.75
+SWARM_MIN_PLATOON_GAP = 4.5
+SWARM_MAX_SPEED_DELTA = 0.6
+# 仿生层参考车辆筛选：低速/停止车辆通常代表局部受阻，不参与畅通车道的速度对齐。
+SWARM_MIN_REFERENCE_SPEED = 5.0
+SWARM_REFERENCE_SPEED_RATIO = 0.7
 
 # 实验统计结果和 GUI 配置文件路径。
 RESULTS_FILE = os.path.join(os.path.dirname(__file__), "platoon_results.csv")
@@ -473,9 +482,47 @@ def maybe_execute_mobil_lane_change(veh_id, leader, obstacle):
 
 
 def apply_swarm_layer(base_speed, current_speed, neighbors, leader):
-    """上层仿生编队规则占位函数；当前不施加任何编队控制。"""
-    _ = current_speed, neighbors, leader
-    return base_speed
+    """上层仿生编队规则：在有限感知内诱导局部正向协同。
+
+    设计原则：
+    1. 不替代单车自动驾驶层，只在 IDM/MOBIL 给出的 base_speed 上做小幅修正。
+    2. 不直接处理危险工况，最终仍交给后续安全层和 SUMO fallback 兜底。
+    3. 只使用本车有限感知到的邻居信息，让类似编队的行为自发涌现。
+    4. 当前版本只做正向速度微调，不主动降速；降速由安全层和 IDM 负责。
+    """
+    if not neighbors:
+        return base_speed
+
+    speed_delta = 0.0
+    reference_neighbors = [
+        item
+        for item in neighbors
+        if item["speed"] >= SWARM_MIN_REFERENCE_SPEED
+        and item["speed"] >= current_speed * SWARM_REFERENCE_SPEED_RATIO
+    ]
+
+    # 规则 1：正向速度对齐。低速/停车邻居不参与对齐，避免畅通车道被堵塞车道拖慢。
+    if reference_neighbors:
+        neighbor_mean_speed = statistics.fmean(item["speed"] for item in reference_neighbors)
+        if neighbor_mean_speed > current_speed:
+            speed_delta += SWARM_ALIGNMENT_GAIN * (neighbor_mean_speed - current_speed)
+
+    # 规则 2：温和凝聚。当前车距大于期望头距时，允许略微追赶前方车群。
+    if leader:
+        desired_gap = max(
+            SWARM_MIN_PLATOON_GAP,
+            current_speed * SWARM_DESIRED_HEADWAY,
+        )
+        gap_error = leader["distance"] - desired_gap
+        if gap_error > 0:
+            speed_delta += SWARM_COHESION_GAIN * min(gap_error / desired_gap, 1.0)
+
+        # 规则 3：分离占位。当前暂不主动降速，避免与安全层/IDM 形成重复保守控制。
+        if gap_error < 0 and SWARM_SEPARATION_GAIN > 0:
+            speed_delta += SWARM_SEPARATION_GAIN * max(gap_error / desired_gap, -1.0)
+
+    speed_delta = clamp(speed_delta, 0.0, SWARM_MAX_SPEED_DELTA)
+    return base_speed + speed_delta
 
 
 def apply_safety_layer(target_speed, veh_id, leader, params):
@@ -586,7 +633,7 @@ def compute_layered_target_speed(veh_id, vehicle_states, enable_swarm_rules):
 
     target_speed = idm_target_speed(current_speed, leader, obstacle, params)
     if enable_swarm_rules:
-        # 仿生编队层当前为空，占位保留，后续可逐条添加规则。
+        # 仿生编队层采用温和局部规则，最终仍受安全层限制。
         target_speed = apply_swarm_layer(target_speed, current_speed, neighbors, leader)
     target_speed = apply_safety_layer(target_speed, veh_id, leader, params)
     target_speed = apply_static_obstacle_safety(target_speed, veh_id, obstacle, params)
