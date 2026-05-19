@@ -1,6 +1,0 @@
-<?xml version='1.0' encoding='UTF-8'?>
-<additional>
-    <poi id="obs_0" type="static_obstacle" color="220,40,40" lane="west_to_east_2" pos="350.0" posLat="0" friendlyPos="true" width="2.4" height="5.5" layer="10" />
-    <poi id="obs_1" type="static_obstacle" color="220,40,40" lane="west_to_east_1" pos="650.0" posLat="0" friendlyPos="true" width="2.4" height="5.5" layer="10" />
-    <poi id="obs_2" type="static_obstacle" color="220,40,40" lane="west_to_east_0" pos="950.0" posLat="0" friendlyPos="true" width="2.4" height="5.5" layer="10" />
-</additional>
