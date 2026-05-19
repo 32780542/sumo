@@ -1,0 +1,5 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<edges>
+    <edge id="west_to_merge" from="west" to="merge" type="three_lane_road" />
+    <edge id="merge_to_east" from="merge" to="east" type="two_lane_road" />
+</edges>

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2026-05-13T21:11:33.959792+08:00 by Eclipse SUMO netconvert 1.26.0
+<netconvertConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/netconvertConfiguration.xsd">
+
+    <input>
+        <node-files value="D:\sumo\network\platoon.nod.xml"/>
+        <edge-files value="D:\sumo\network\platoon.edg.xml"/>
+        <type-files value="D:\sumo\network\platoon.typ.xml"/>
+    </input>
+
+    <output>
+        <output-file value="D:\sumo\network\platoon.net.xml"/>
+    </output>
+
+    <junctions>
+        <no-turnarounds value="true"/>
+    </junctions>
+
+</netconvertConfiguration>
+-->
+
+<net version="1.20" junctionCornerDetail="5" limitTurnSpeed="5.50" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/net_file.xsd">
+
+    <location netOffset="0.00,0.00" convBoundary="0.00,0.00,1200.00,0.00" origBoundary="0.00,0.00,1200.00,0.00" projParameter="!"/>
+
+    <type id="three_lane_road" numLanes="3" speed="30.00"/>
+    <type id="two_lane_road" numLanes="2" speed="30.00"/>
+
+    <edge id=":merge_0" function="internal">
+        <lane id=":merge_0_0" index="0" speed="30.00" length="8.00" shape="796.00,-4.80 804.00,-4.80"/>
+        <lane id=":merge_0_1" index="1" speed="30.00" length="8.00" shape="796.00,-1.60 804.00,-1.60"/>
+    </edge>
+
+    <edge id="merge_to_east" from="merge" to="east" priority="-1" type="two_lane_road">
+        <lane id="merge_to_east_0" index="0" speed="30.00" length="396.00" shape="804.00,-4.80 1200.00,-4.80"/>
+        <lane id="merge_to_east_1" index="1" speed="30.00" length="396.00" shape="804.00,-1.60 1200.00,-1.60"/>
+    </edge>
+    <edge id="west_to_merge" from="west" to="merge" priority="-1" type="three_lane_road">
+        <lane id="west_to_merge_0" index="0" speed="30.00" length="796.00" shape="0.00,-8.00 796.00,-8.00"/>
+        <lane id="west_to_merge_1" index="1" speed="30.00" length="796.00" shape="0.00,-4.80 796.00,-4.80"/>
+        <lane id="west_to_merge_2" index="2" speed="30.00" length="796.00" shape="0.00,-1.60 796.00,-1.60"/>
+    </edge>
+
+    <junction id="east" type="dead_end" x="1200.00" y="0.00" incLanes="merge_to_east_0 merge_to_east_1" intLanes="" shape="1200.00,-6.40 1200.00,0.00"/>
+    <junction id="merge" type="priority" x="800.00" y="0.00" incLanes="west_to_merge_0 west_to_merge_1 west_to_merge_2" intLanes=":merge_0_0 :merge_0_1" shape="804.00,0.00 804.00,-6.40 800.97,-7.23 799.03,-8.77 797.79,-9.36 796.00,-9.60 796.00,0.00">
+        <request index="0" response="00" foes="00" cont="0"/>
+        <request index="1" response="00" foes="00" cont="0"/>
+    </junction>
+    <junction id="west" type="dead_end" x="0.00" y="0.00" incLanes="" intLanes="" shape="0.00,0.00 0.00,-9.60"/>
+
+    <connection from="west_to_merge" to="merge_to_east" fromLane="1" toLane="0" via=":merge_0_0" dir="s" state="M"/>
+    <connection from="west_to_merge" to="merge_to_east" fromLane="2" toLane="1" via=":merge_0_1" dir="s" state="M"/>
+
+    <connection from=":merge_0" to="merge_to_east" fromLane="0" toLane="0" dir="s" state="M"/>
+    <connection from=":merge_0" to="merge_to_east" fromLane="1" toLane="1" dir="s" state="M"/>
+
+</net>

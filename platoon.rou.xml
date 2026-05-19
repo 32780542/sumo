@@ -1,5 +1,0 @@
-<?xml version='1.0' encoding='UTF-8'?>
-<routes>
-    <vType id="AV" vClass="passenger" guiShape="passenger" carFollowModel="IDM" accel="2.6" decel="4.5" minGap="2.0" maxSpeed="30.0" length="4.8" width="1.8" color="0,80,255" />
-    <route id="r_west_to_east" edges="west_to_east" />
-</routes>

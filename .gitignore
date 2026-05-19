@@ -41,6 +41,7 @@ ehthumbs.db
 # SUMO/generated simulation outputs
 fcd_output*.xml
 test_*_fcd.xml
+test_*.xml
 *_fcd.xml
 *_results.csv
 *.tripinfo.xml

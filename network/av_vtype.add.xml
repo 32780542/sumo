@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<additional>
+    <vType id="AV"
+           carFollowModel="IDM"
+           accel="2.6"
+           decel="4.5"
+           minGap="2.0"
+           maxSpeed="30"/>
+</additional>

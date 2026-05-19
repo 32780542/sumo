@@ -1,4 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<edges>
-    <edge id="west_to_east" from="west" to="east" type="three_lane_road"/>
-</edges>
